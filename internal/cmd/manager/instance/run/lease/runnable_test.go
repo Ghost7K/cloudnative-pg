@@ -569,3 +569,116 @@ var _ = Describe("classifyLeaseAfterRun", func() {
 			To(Equal(leaseStillHeld))
 	})
 })
+
+var _ = Describe("Runnable.Suspend and Runnable.Resume", func() {
+	const (
+		namespace   = "test-ns"
+		clusterName = "test-cluster"
+		thisPod     = "test-cluster-1"
+	)
+
+	cfg := Config{
+		LeaseDuration:         3 * time.Second,
+		RenewDeadline:         2 * time.Second,
+		RetryPeriod:           100 * time.Millisecond,
+		ReleasedLeaseDuration: time.Second,
+	}
+
+	var (
+		kubeClient *fake.Clientset
+		instance   *postgres.Instance
+		r          *Runnable
+		startErr   chan error
+	)
+
+	holder := func(ctx context.Context) string {
+		l, err := kubeClient.CoordinationV1().Leases(namespace).Get(ctx, clusterName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		return ptr.Deref(l.Spec.HolderIdentity, "")
+	}
+
+	BeforeEach(func() {
+		// The operator creates the lease object, with no holder
+		kubeClient = fake.NewClientset(&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: clusterName},
+		})
+		instance = postgres.NewInstance().
+			WithNamespace(namespace).
+			WithPodName(thisPod).
+			WithClusterName(clusterName)
+		r = New(kubeClient, instance)
+
+		runCtx, cancel := context.WithCancel(context.Background())
+		startErr = make(chan error, 1)
+		go func() { startErr <- r.Start(runCtx) }()
+		DeferCleanup(func() {
+			cancel()
+			// Start returns an error when it detects that another pod took the lease
+			Eventually(startErr).Should(Receive())
+		})
+	})
+
+	acquire := func(ctx context.Context) error {
+		acquireCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return r.Acquire(acquireCtx, cfg)
+	}
+
+	It("releases the lease, stops renewing it, and does not stop the runnable", func(ctx context.Context) {
+		Expect(acquire(ctx)).To(Succeed())
+		Expect(holder(ctx)).To(Equal(thisPod))
+
+		Expect(r.Suspend(ctx)).To(Succeed())
+		Expect(r.IsSuspended()).To(BeTrue())
+		Expect(holder(ctx)).To(BeEmpty())
+
+		// a renewal or a new acquisition would write the holder again
+		Consistently(func() string { return holder(ctx) }, 1500*time.Millisecond, 100*time.Millisecond).
+			Should(BeEmpty())
+		Expect(startErr).ToNot(Receive())
+
+		Expect(r.Acquire(ctx, cfg)).To(MatchError(ErrSuspended))
+	})
+
+	It("takes the lease again after Resume", func(ctx context.Context) {
+		Expect(acquire(ctx)).To(Succeed())
+		Expect(r.Suspend(ctx)).To(Succeed())
+
+		r.Resume()
+		Expect(r.IsSuspended()).To(BeFalse())
+
+		Expect(acquire(ctx)).To(Succeed())
+		Expect(holder(ctx)).To(Equal(thisPod))
+	})
+
+	It("is idempotent", func(ctx context.Context) {
+		Expect(acquire(ctx)).To(Succeed())
+		Expect(r.Suspend(ctx)).To(Succeed())
+		Expect(r.Suspend(ctx)).To(Succeed())
+		r.Resume()
+		r.Resume()
+		Expect(acquire(ctx)).To(Succeed())
+	})
+
+	It("releases the lease even during an in-place instance manager upgrade", func(ctx context.Context) {
+		Expect(acquire(ctx)).To(Succeed())
+		instance.InstanceManagerIsUpgrading.Store(true)
+
+		Expect(r.Suspend(ctx)).To(Succeed())
+
+		Expect(holder(ctx)).To(BeEmpty())
+	})
+
+	It("does not touch a lease held by another pod", func(ctx context.Context) {
+		Expect(acquire(ctx)).To(Succeed())
+		l, err := kubeClient.CoordinationV1().Leases(namespace).Get(ctx, clusterName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		l.Spec.HolderIdentity = ptr.To("test-cluster-2")
+		_, err = kubeClient.CoordinationV1().Leases(namespace).Update(ctx, l, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(r.Suspend(ctx)).To(Succeed())
+
+		Expect(holder(ctx)).To(Equal("test-cluster-2"))
+	})
+})

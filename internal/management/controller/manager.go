@@ -44,6 +44,15 @@ import (
 // PrimaryLeaseAcquirer is the interface the primary lease runnable exposes to the reconciler.
 type PrimaryLeaseAcquirer interface {
 	Acquire(ctx context.Context, config lease.Config) error
+
+	// Suspend releases the lease and keeps the instance from acquiring it, see lease.Runnable
+	Suspend(ctx context.Context) error
+
+	// Resume lets the instance compete for the lease again
+	Resume()
+
+	// IsSuspended tells whether the lease is suspended
+	IsSuspended() bool
 }
 
 // InstanceReconciler reconciles the status of the Cluster resource with

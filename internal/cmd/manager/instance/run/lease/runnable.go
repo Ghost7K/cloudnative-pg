@@ -104,6 +104,22 @@ type Runnable struct {
 	heldCh   chan struct{}
 	heldOnce sync.Once
 
+	// mu protects the fields below, and the replacement of heldCh and heldOnce
+	// done by Suspend
+	mu sync.Mutex
+
+	// suspended is true while the instance must neither hold nor acquire the
+	// lease (see Suspend)
+	suspended bool
+
+	// resumeCh is closed by Resume and unblocks the leader election loop
+	resumeCh chan struct{}
+
+	// cancelIteration and iterationDone belong to the running iteration of the
+	// leader election loop
+	cancelIteration context.CancelFunc
+	iterationDone   chan struct{}
+
 	// observedRecord is the lease state tryTakeOver is timing for liveness and
 	// observedTime is when it first saw that state; see tryTakeOver for how they
 	// detect a holder that has stopped renewing without comparing against the
@@ -155,12 +171,124 @@ func (r *Runnable) Acquire(ctx context.Context, config Config) error {
 		close(r.activateCh)
 	})
 
+	r.mu.Lock()
+	suspended := r.suspended
+	heldCh := r.heldCh
+	r.mu.Unlock()
+	if suspended {
+		return ErrSuspended
+	}
+
 	select {
-	case <-r.heldCh:
+	case <-heldCh:
+		if r.IsSuspended() {
+			return ErrSuspended
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// ErrSuspended is returned by Acquire while the lease is suspended
+var ErrSuspended = fmt.Errorf("the primary lease is suspended")
+
+// IsSuspended tells whether the lease is currently suspended
+func (r *Runnable) IsSuspended() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.suspended
+}
+
+// Suspend releases the lease and keeps this instance from renewing or
+// acquiring it until Resume is called. It is used when the write path of the
+// primary is stalled: the instance can't serve writes, and it must not stand
+// in the way of the promotion of a replica.
+//
+// Unlike a loss of the lease, a suspension never stops the instance manager.
+// Suspend waits for the running election iteration to terminate before
+// writing the release, so that a renewal can't undo it. Contrary to Release,
+// it releases the lease even during an in-place instance manager upgrade.
+func (r *Runnable) Suspend(ctx context.Context) error {
+	r.mu.Lock()
+	if r.suspended {
+		r.mu.Unlock()
+		return nil
+	}
+	r.suspended = true
+	r.resumeCh = make(chan struct{})
+	cancel, done := r.cancelIteration, r.iterationDone
+	r.mu.Unlock()
+
+	log.FromContext(ctx).Info("Suspending the primary lease")
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// The election loop is not running anymore (it waits for Resume), and
+	// nothing else uses heldCh and heldOnce for writing. Acquire has to wait
+	// for a new election after Resume.
+	r.mu.Lock()
+	r.heldCh = make(chan struct{})
+	r.heldOnce = sync.Once{}
+	r.mu.Unlock()
+
+	return r.release(ctx)
+}
+
+// Resume lets the instance compete for the lease again after a Suspend
+func (r *Runnable) Resume() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.suspended {
+		return
+	}
+	r.suspended = false
+	close(r.resumeCh)
+}
+
+// waitUntilNotSuspended blocks while the lease is suspended
+func (r *Runnable) waitUntilNotSuspended(ctx context.Context) error {
+	r.mu.Lock()
+	if !r.suspended {
+		r.mu.Unlock()
+		return nil
+	}
+	resumeCh := r.resumeCh
+	r.mu.Unlock()
+
+	select {
+	case <-resumeCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// beginIteration creates the context of one election iteration, that Suspend
+// can cancel. It returns false when the lease is suspended.
+func (r *Runnable) beginIteration(ctx context.Context) (context.Context, func(), bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.suspended {
+		return nil, nil, false
+	}
+	iterCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	r.cancelIteration = cancel
+	r.iterationDone = done
+	return iterCtx, func() {
+		cancel()
+		close(done)
+	}, true
 }
 
 // Release explicitly releases the lease so that a replica can promote without
@@ -192,6 +320,13 @@ func (r *Runnable) Release(ctx context.Context) error {
 		contextLogger.Info("Instance manager is upgrading in place, keeping the primary lease held")
 		return nil
 	}
+
+	return r.release(ctx)
+}
+
+// release writes the release of the lease, if this pod is the current holder
+func (r *Runnable) release(ctx context.Context) error {
+	contextLogger := log.FromContext(ctx)
 
 	// Unlike tryTakeOver/runLeaderElection, this Get is deliberately not
 	// bounded at all: Release makes no retry of its own, so any deadline here
@@ -455,9 +590,22 @@ func (r *Runnable) runLeaderElection(ctx context.Context) error {
 	contextLogger := log.FromContext(ctx).WithName("primary-lease")
 
 	for {
-		if err := r.preAcquire(ctx); err != nil {
-			// preAcquire only returns ctx.Err(); treat as clean shutdown.
+		if err := r.waitUntilNotSuspended(ctx); err != nil {
 			return nil
+		}
+		iterCtx, finish, ok := r.beginIteration(ctx)
+		if !ok {
+			continue
+		}
+
+		if err := r.preAcquire(iterCtx); err != nil {
+			finish()
+			// preAcquire only returns the context error: either the shutdown
+			// of the instance manager, or the suspension of the lease.
+			if ctx.Err() != nil || !r.IsSuspended() {
+				return nil
+			}
+			continue
 		}
 		r.heldOnce.Do(func() {
 			contextLogger.Info("Acquired primary lease")
@@ -488,14 +636,23 @@ func (r *Runnable) runLeaderElection(ctx context.Context) error {
 			},
 		})
 		if err != nil {
+			finish()
 			return err
 		}
 
-		le.Run(ctx)
+		le.Run(iterCtx)
+		finish()
 
 		// Scenario 1: clean shutdown.
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		// Scenario 1b: deliberate suspension, which is neither a lost lease
+		// nor a failure.
+		if r.IsSuspended() {
+			contextLogger.Info("Primary lease suspended, waiting to be resumed")
+			continue
 		}
 
 		// le.Run exited unexpectedly. Read the lease to distinguish a transient
