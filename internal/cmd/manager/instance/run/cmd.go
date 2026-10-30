@@ -392,6 +392,11 @@ func runSubCommand( //nolint: gocyclo,gocognit
 		}
 	}()
 
+	if err = mgr.Add(newWritePathMonitor(instance, leaseRunnable)); err != nil {
+		contextLogger.Error(err, "unable to add the write path monitor")
+		return err
+	}
+
 	remoteSrv, err := webserver.NewRemoteWebServer(instance, onlineUpgradeCancelFunc, exitedConditions)
 	if err != nil {
 		contextLogger.Error(err, "unable to create remote webserver runnable")

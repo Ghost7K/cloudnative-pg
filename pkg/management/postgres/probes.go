@@ -43,6 +43,7 @@ func (instance *Instance) GetStatus() (result *postgres.PostgresqlStatus, err er
 		Pod:                    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: instance.GetPodName()}},
 		InstanceManagerVersion: versions.Version,
 		MightBeUnavailable:     instance.MightBeUnavailable(),
+		IsWritePathStalled:     instance.WritePath.Stalled(),
 	}
 
 	// this deferred function may override the error returned. Take extra care.
