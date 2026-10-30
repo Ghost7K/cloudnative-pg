@@ -274,6 +274,93 @@ the primary lease coordinates *which instance is allowed to promote*. The two
 mechanisms are complementary.
 :::
 
+### Write path check
+
+A PostgreSQL primary can be alive, accept connections and be reported as ready,
+while every write blocks, for example because the underlying storage hangs in
+a way that makes `fsync` never return. The liveness and readiness probes do not
+notice it, and no failover happens.
+
+The **write path check** detects this situation. It is **disabled by default**
+and is enabled with:
+
+```yaml
+spec:
+  probes:
+    liveness:
+      writePathCheck:
+        enabled: true
+        # optional, these are the defaults
+        periodSeconds: 10
+        timeoutSeconds: 30
+        clearAfterSuccesses: 3
+```
+
+When enabled, the instance manager of the primary executes a *heartbeat* every
+`periodSeconds`, on a dedicated connection:
+
+```sql
+BEGIN;
+SET LOCAL synchronous_commit = local;
+SELECT pg_catalog.pg_logical_emit_message(true, 'cnpg-write-path-check', '');
+COMMIT;
+```
+
+The heartbeat only waits for the *local* WAL flush: it doesn't wait for the
+synchronous standbys, so a missing or slow replica is never reported as a
+stalled write path. It works with all the supported PostgreSQL versions. A new
+heartbeat starts only when the previous one has completed.
+
+If a heartbeat has not completed after `timeoutSeconds`, the write path is
+considered **stalled**. An *error* of the heartbeat (for example a full disk)
+is not a stall: it is only logged, and no failover happens. This is consistent
+with the fact that CloudNativePG does not fail over when the disk is full.
+
+When the write path is stalled:
+
+- the instance manager reports `isWritePathStalled: true` in its status;
+- the instance releases the [primary lease](failover.md#safe-primary-election)
+  and doesn't renew nor acquire it, so that another instance can take it;
+- the instance terminates its WAL senders, repeatedly. A primary whose WAL flush
+  is blocked still sends keepalives to its replicas: without this step the
+  WAL receivers would never go down, and the operator waits for all of them
+  before promoting a replica;
+- the operator sorts the instance **after** the healthy ones when electing the
+  primary, so that the regular [failover](failover.md) procedure starts and
+  promotes the most advanced healthy replica. While the failover is pending, the
+  instance manager of each replica also terminates its own WAL receiver.
+
+Once the target primary is another instance, the stall is *latched* and the
+former primary is shut down with an **immediate** shutdown, without a
+checkpoint (which would block too). The shutdown request takes effect as soon as
+the storage recovers, before any blocked commit can be acknowledged to a client.
+The instance then restarts and rejoins the cluster as a replica, running
+`pg_rewind` if needed, as after any failover. If the storage recovers *before*
+a failover started, the stall is cleared after `clearAfterSuccesses`
+consecutive successful heartbeats and the instance resumes its role.
+
+:::warning
+The write path check has some limits:
+
+- **No healthy replica, no failover.** If there is no healthy replica to be
+  promoted, the stalled primary stays the primary, as it would have been
+  without the check. The same happens when the
+  [failover quorum](failover.md#failover-quorum-quorum-based-failover) prevents
+  the failover.
+- **No failover on a full disk.** A heartbeat that fails with an error never
+  triggers a failover.
+- **The switchover takes about 40–60 seconds** with the default settings:
+  up to `timeoutSeconds` plus `periodSeconds` to detect the stall, then the
+  time for the operator to complete the failover. The commits issued during that
+  time are blocked, and they are not acknowledged.
+- The check adds a small WAL record every `periodSeconds`: on an otherwise idle
+  cluster this makes the WAL archive and the checkpoints run as if the cluster
+  was not idle.
+- The liveness probe is not failed: restarting the container wouldn't help
+  when the storage is blocked, and the instance manager takes care of the
+  shutdown of PostgreSQL as described above.
+:::
+
 ## Readiness Probe
 
 The readiness probe starts once the startup probe has successfully completed.
