@@ -634,7 +634,7 @@ _Appears in:_
 | `maxSyncReplicas` _integer_ | The target value for the synchronous replication quorum, that can be<br />decreased if the number of ready standbys is lower than this.<br />Undefined or 0 disable synchronous replication. |  | 0 | Minimum: 0 <br /> |
 | `postgresql` _[PostgresConfiguration](#postgresconfiguration)_ | Configuration of the PostgreSQL server |  |  |  |
 | `podSelectorRefs` _[PodSelectorRef](#podselectorref) array_ | PodSelectorRefs defines named pod label selectors that can be referenced<br />in pg_hba rules using the $\{podselector:NAME\} syntax in the address field.<br />The operator resolves matching pod IPs and the instance manager expands<br />pg_hba lines accordingly. Only pods in the Cluster's own namespace are considered. |  |  |  |
-| `replicationSlots` _[ReplicationSlotsConfiguration](#replicationslotsconfiguration)_ | Replication slots management configuration |  | \{ highAvailability\: \{ enabled:true \} \} |  |
+| `replicationSlots` _[ReplicationSlotsConfiguration](#replicationslotsconfiguration)_ | Replication slots management configuration |  | \{ highAvailability:map[enabled:true] \} |  |
 | `bootstrap` _[BootstrapConfiguration](#bootstrapconfiguration)_ | Instructions to bootstrap this cluster |  |  |  |
 | `replica` _[ReplicaClusterConfiguration](#replicaclusterconfiguration)_ | Replica cluster configuration |  |  |  |
 | `superuserSecret` _[LocalObjectReference](https://pkg.go.dev/github.com/cloudnative-pg/machinery/pkg/api#LocalObjectReference)_ | The secret containing the superuser password. If not defined a new<br />secret will be created with a randomly generated password |  |  |  |
@@ -1611,6 +1611,7 @@ _Appears in:_
 | `failureThreshold` _integer_ | Minimum consecutive failures for the probe to be considered failed after having succeeded.<br />Defaults to 3. Minimum value is 1. |  |  |  |
 | `terminationGracePeriodSeconds` _integer_ | Optional duration in seconds the pod needs to terminate gracefully upon probe failure.<br />The grace period is the duration in seconds after the processes running in the pod are sent<br />a termination signal and the time when the processes are forcibly halted with a kill signal.<br />Set this value longer than the expected cleanup time for your process.<br />If this value is nil, the pod's terminationGracePeriodSeconds will be used. Otherwise, this<br />value overrides the value provided by the pod spec.<br />Value must be non-negative integer. The value zero indicates stop immediately via<br />the kill signal (no opportunity to shut down).<br />This is a beta field and requires enabling ProbeTerminationGracePeriod feature gate.<br />Minimum value is 1. spec.terminationGracePeriodSeconds is used if unset. |  |  |  |
 | `isolationCheck` _[IsolationCheckConfiguration](#isolationcheckconfiguration)_ | Configure the feature that extends the liveness probe for a primary<br />instance. In addition to the basic checks, this reports whether the<br />primary is isolated from the Kubernetes API server and from its<br />replicas, so the kubelet restarts it through the normal<br />container-termination path (a smart shutdown, bounded by<br />`.spec.smartShutdownTimeout`) when a network partition or API<br />unavailability is detected. Enabled by default. |  |  |  |
+| `writePathCheck` _[WritePathCheckConfiguration](#writepathcheckconfiguration)_ | Configure the write path check of the primary instance. When enabled,<br />the instance manager periodically performs a minimal local write<br />(a WAL flush that does not wait for synchronous standbys) and, if it<br />does not complete within the configured timeout, it reports the primary<br />as having a stalled write path. If a healthy replica is available, the<br />operator then fails over to it. Disabled by default. |  |  |  |
 
 
 
@@ -3336,5 +3337,26 @@ _Appears in:_
 | `onlineConfiguration` _[OnlineConfiguration](#onlineconfiguration)_ | Configuration parameters to control the online/hot backup with volume snapshots |  | \{ immediateCheckpoint:false waitForArchive:true \} |  |
 
 
+
+
+#### WritePathCheckConfiguration
+
+
+
+WritePathCheckConfiguration contains the configuration for the write path
+check of the primary instance
+
+
+
+_Appears in:_
+
+- [LivenessProbe](#livenessprobe)
+
+| Field | Description | Required | Default | Validation |
+| --- | --- | --- | --- | --- |
+| `enabled` _boolean_ | Whether the write path check is enabled. Defaults to false. |  | false |  |
+| `periodSeconds` _integer_ | Interval in seconds between two heartbeats. A new heartbeat is started<br />only when the previous one has completed. Defaults to 10. |  |  | Minimum: 1 <br /> |
+| `timeoutSeconds` _integer_ | Duration in seconds after which a heartbeat that has not completed<br />marks the write path of the primary as stalled. Defaults to 30.<br />Must be greater than `periodSeconds`. |  |  | Minimum: 1 <br /> |
+| `clearAfterSuccesses` _integer_ | Number of consecutive successful heartbeats required to clear a<br />stalled write path. A stall is never cleared once a failover or<br />switchover away from this instance has started. Defaults to 3. |  |  | Minimum: 1 <br /> |
 
 

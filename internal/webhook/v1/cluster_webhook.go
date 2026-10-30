@@ -28,6 +28,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	barmanWebhooks "github.com/cloudnative-pg/barman-cloud/pkg/api/webhooks"
 	"github.com/cloudnative-pg/machinery/pkg/image/reference"
@@ -209,6 +210,7 @@ func (v *ClusterCustomValidator) validate(r *apiv1.Cluster) (allErrs field.Error
 		v.validatePromotionToken,
 		v.validatePluginConfiguration,
 		v.validateLivenessPingerProbe,
+		v.validateWritePathCheck,
 		v.validatePodSelectorRefs,
 		v.validateExtensions,
 		v.validateServiceAccountConfig,
@@ -2935,6 +2937,44 @@ func (v *ClusterCustomValidator) validateLivenessPingerProbe(r *apiv1.Cluster) f
 	}
 
 	return nil
+}
+
+// validateWritePathCheck validates the write path check configuration of the liveness probe
+func (v *ClusterCustomValidator) validateWritePathCheck(r *apiv1.Cluster) field.ErrorList {
+	if r.Spec.Probes == nil || r.Spec.Probes.Liveness == nil || r.Spec.Probes.Liveness.WritePathCheck == nil {
+		return nil
+	}
+
+	cfg := r.Spec.Probes.Liveness.WritePathCheck
+	basePath := field.NewPath("spec", "probes", "liveness", "writePathCheck")
+
+	var result field.ErrorList
+	if cfg.PeriodSeconds != nil && *cfg.PeriodSeconds < 1 {
+		result = append(result, field.Invalid(
+			basePath.Child("periodSeconds"), *cfg.PeriodSeconds, "must be greater than zero"))
+	}
+	if cfg.TimeoutSeconds != nil && *cfg.TimeoutSeconds < 1 {
+		result = append(result, field.Invalid(
+			basePath.Child("timeoutSeconds"), *cfg.TimeoutSeconds, "must be greater than zero"))
+	}
+	if cfg.ClearAfterSuccesses != nil && *cfg.ClearAfterSuccesses < 1 {
+		result = append(result, field.Invalid(
+			basePath.Child("clearAfterSuccesses"), *cfg.ClearAfterSuccesses, "must be at least 1"))
+	}
+	if len(result) > 0 {
+		return result
+	}
+
+	// The effective values (explicit or default) must be coherent
+	if r.GetWritePathCheckTimeout() <= r.GetWritePathCheckPeriod() {
+		result = append(result, field.Invalid(
+			basePath.Child("timeoutSeconds"),
+			int32(r.GetWritePathCheckTimeout()/time.Second),
+			fmt.Sprintf("must be greater than periodSeconds (%d)", int32(r.GetWritePathCheckPeriod()/time.Second)),
+		))
+	}
+
+	return result
 }
 
 func (v *ClusterCustomValidator) validateExtensions(r *apiv1.Cluster) field.ErrorList {
