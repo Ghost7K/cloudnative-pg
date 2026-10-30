@@ -1,0 +1,84 @@
+# Builds the operator image of this fork (which is also the image of the
+# instance manager) and pushes it to the GitHub Container Registry.
+#
+# It is specific to the fork: it does not use goreleaser, docker bake, the
+# signing nor the attestations of the upstream release pipeline.
+name: fork-image
+
+on:
+  push:
+    branches:
+      - feat/write-path-check
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/ghost7k/cloudnative-pg
+  BUILD_VERSION: 1.30.1-wpc
+
+jobs:
+  image:
+    name: Build and push the amd64 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build the manager binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist/manager
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/cloudnative-pg/cloudnative-pg/pkg/versions.buildVersion=${BUILD_VERSION} \
+              -X github.com/cloudnative-pg/cloudnative-pg/pkg/versions.buildCommit=${GITHUB_SHA} \
+              -X github.com/cloudnative-pg/cloudnative-pg/pkg/versions.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o dist/manager/manager_amd64 ./cmd/manager
+
+      - name: Compute the image tags
+        id: tags
+        run: |
+          echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tags.outputs.sha }}
+            ${{ env.IMAGE }}:${{ env.BUILD_VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.BUILD_VERSION }}
