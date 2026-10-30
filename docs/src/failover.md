@@ -258,6 +258,11 @@ detect it and fail over to a healthy replica. The check is disabled by default,
 it requires a healthy replica to fail over to, and it doesn't trigger a
 failover when the disk is full.
 
+A stalled primary changes nothing the operator watches: its pod stays ready.
+For this reason, when the check is enabled, the operator reconciles the
+cluster at least once per `periodSeconds`, so that a stall is noticed within
+one check period of being reported by the instance manager.
+
 ## Detection of node-level failures
 
 When the node hosting the primary becomes unreachable (for example, due to a
